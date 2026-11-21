@@ -239,6 +239,18 @@ One inference with 5 denoising steps, median of 12 recorded frames:
 The first inference compiles; the adapter does it at start on a blank observation (about 14 s for compile alone, 22 s
 with the frame cache, whose second token shape is compiled too). Peak memory is unchanged.
 
+In closed-loop use the saving is the same. Simulator rollouts of seven tasks, each setting in its own process, the
+two side by side on one RTX PRO 6000 Blackwell that other jobs were also using (so both are slower than above), time
+of one inference as the adapter measures it (with the observation's serialization and the pipe):
+
+| | Inferences | Median | Mean | 90th percentile |
+|---|---|---|---|---|
+| Neither | 4474 | 376 ms | 393 ms | 461 ms |
+| Both | 4332 | **263 ms** | 285 ms | 367 ms |
+
+Per task the median went from 360–418 ms to 248–304 ms. The first inference of each run is left out: without a
+warm-up it is the compilation, 24–32 s there.
+
 ### How much the output changes
 
 Without the option, two runs give bit-identical chunks. With it the fused kernels round differently and the
