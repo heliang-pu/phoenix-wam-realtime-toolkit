@@ -8,7 +8,8 @@ robot. Everything here wraps the upstream code; none of it is modified or copied
 
 - **Training**: post-train the released model on a robot it has not seen, with a new soft prompt slot.
 - **Inference**: a worker process that holds the model, and an adapter that executes its action chunks.
-- **Acceleration**: the same computation with fewer operator calls, 21–27 % less time per inference.
+- **Acceleration**: the same computation with fewer operator calls and no repeated work, a third less time per
+  inference.
 - **Asynchronous execution**: the next chunk is computed while the arm keeps moving, and is made to continue the
   running one.
 
@@ -169,7 +170,7 @@ The options are documented in `deploy_policy.yml`:
 | `phoenix_denoise_steps` | Denoising steps (video and actions share one schedule) |
 | `phoenix_seed` | Noise seed of every chunk; -1 draws fresh noise each time |
 | `phoenix_stall_steps`, `phoenix_stall_fix` | Detect chunks requested after no progress and draw them differently |
-| `phoenix_compile` | Acceleration (below) |
+| `phoenix_compile`, `phoenix_frame_cache` | Acceleration (below) |
 | `phoenix_async`, `phoenix_inference_delay` | Asynchronous chunks (below) |
 | `phoenix_rtc_infer` | Join asynchronous chunks at inference (below) |
 | `phoenix_rtc_prefix` | Hand a Training RTC checkpoint the steps it must continue |
@@ -178,7 +179,8 @@ The options are documented in `deploy_policy.yml`:
 
 ## Acceleration
 
-`phoenix_compile: true` (worker flag `--compile default`). Nothing is quantized and no step is removed.
+Two independent options: `phoenix_compile: true` (worker flag `--compile default`) and `phoenix_frame_cache: true`
+(`--frame-cache`). Nothing is quantized and no denoising step is removed.
 
 ### Where the time goes
 
@@ -195,7 +197,7 @@ The trunk is not limited by matrix products. Its linear layers alone, timed sepa
 22 ms per forward against 44 ms measured; the profiler counts about 64 000 operator calls per inference. The rest is
 small elementwise kernels (float32 RMS norms, modulation, gates, casts) and the cost of launching them.
 
-### What the option does
+### What `phoenix_compile` does
 
 1. **Trunk.** Each block's two halves (upstream's `_build_expert_attention_io` and `_apply_expert_post_block`) get
    their own `torch.compile` frame. Upstream's functions are traced as they are; the FlexAttention call between them
@@ -204,14 +206,34 @@ small elementwise kernels (float32 RMS norms, modulation, gates, casts) and the 
 3. **Repeated frames once.** Upstream's online path repeats the current frame nine times before DINO, which then
    encodes nine identical images per camera. They are encoded once and the result is repeated.
 
+### What `phoenix_frame_cache` does
+
+The video sequence is [current frame, noisy future]. Upstream's attention mask lets the current frame's tokens, a
+third of the video tokens, attend only to themselves, and their timestep is 0 at every step. Their hidden states, and
+the keys and values the other tokens read from them, are therefore the same in all five denoising steps, yet they are
+computed five times.
+
+With the option, the first step of an inference runs in full and keeps each layer's keys and values of those tokens.
+The other steps run upstream's own forward on the future and action tokens only, and the mixed attention gets the kept
+keys and values in front of theirs, under the same rows of upstream's mask. Upstream's forward is not rewritten: three
+hooks, on `mot.forward`, `_build_expert_attention_io` and `_mixed_attention`.
+
+A step uses the cache only when its current-frame inputs (tokens, time modulation, RoPE, text context) and the mask
+equal the kept ones bit for bit, checked in one GPU round trip per step. Anything else runs in full: a new frame, a
+padded camera, a backward pass (RTC guidance). Upstream has this idea for a whole static video (`kv_cache.py`), not
+for part of the video expert.
+
 ### Result
 
-| GPU | Before | After | |
-|---|---|---|---|
-| RTX 4090 | 423 ms | 333 ms | −21 % |
-| RTX PRO 6000 Blackwell | 324 ms | 236 ms | −27 % (trunk only: 268 ms) |
+One inference with 5 denoising steps, median of 12 recorded frames:
 
-The first inference compiles (13–21 s); the adapter does it at start on a blank observation. Peak memory is unchanged.
+| GPU | Neither | Frame cache | Compile | Both | |
+|---|---|---|---|---|---|
+| RTX 4090 | 419–423 ms | 368 ms | 330–333 ms | **280 ms** | −34 % |
+| RTX PRO 6000 Blackwell | 324 ms | 298 ms | 236 ms | **214 ms** | −34 % |
+
+The first inference compiles; the adapter does it at start on a blank observation (about 14 s for compile alone, 22 s
+with the frame cache, whose second token shape is compiled too). Peak memory is unchanged.
 
 ### How much the output changes
 
@@ -224,6 +246,19 @@ difference is carried through 30 layers and 5 steps. On 20 recorded frames each 
 | Arm joints, largest difference in a chunk (median over chunks) | 0.008 rad | 0.03–0.09 rad |
 | Gripper opening, mean difference | 0.0007–0.0016 | 0.008–0.010 |
 
+With both options on (12 frames per row, against neither):
+
+| | Both options | A new noise seed |
+|---|---|---|
+| RTX PRO 6000, task A: arm joints, mean difference | 0.0016 rad | 0.019 rad |
+| RTX PRO 6000, task A: gripper opening, mean difference | 0.0020 | 0.011 |
+| RTX 4090, task B: arm joints, mean difference | 0.0007 rad | 0.0063 rad |
+| RTX 4090, task B: gripper opening, mean difference | 0.0005 | 0.0093 |
+
+The frame cache alone changes less than compiling does (0.0003–0.0007 rad), and with it taken off the chunks are bit
+for bit the original ones. In a float64 stand-in of the trunk (in the tests) the cached result equals the full
+forward to 1e-10: the real model's difference is rounding.
+
 So the change is about a tenth of what drawing new noise does. Whether it affects task success has not been
 measured.
 
@@ -231,8 +266,13 @@ measured.
 
 - `mode="reduce-overhead"` (CUDA graphs) does not work with this split: each layer calls one compiled function per
   expert, and the second call invalidates the first one's outputs.
-- Not done: the current frame's tokens only attend to themselves, so their computation is the same in all five
-  denoising steps and could be cached. That needs a forward path of its own.
+- A first version of the frame cache compared the mask once per layer; those 120 GPU round trips per inference
+  cancelled the whole gain. Checks that force a synchronization belong once per step, not per layer.
+- The adapter's side is not worth optimizing: encoding the observation, the npz file and the pipe take about 5 ms
+  together.
+- What is left without changing the computation is small (the text context's keys and values, the image resize on
+  the CPU, the VAE encoder: perhaps 10 ms). Beyond that the computation itself has to change: fewer video denoising
+  steps, distillation.
 
 ## Asynchronous execution and joining chunks
 
@@ -280,6 +320,7 @@ the encoder and Wan base directories; each file's docstring has its command line
 | `profile_infer.py`, `profile_ops.py` | Time per stage; per-operator CUDA time |
 | `gemm_floor.py` | What the GPU reaches on the trunk's matrix products alone |
 | `compare_compiled.py` | Time and output difference, compiled against not |
+| `compare_frame_cache.py` | The same for the frame cache, alone and with compile |
 | `seed_vs_compile.py` | That difference next to a new noise seed |
 | `rtc_offline.py` | Joins: none, inpaint, guidance |
 | `fake_robot_loop.py` | Adapter + real worker on a stand-in robot at 10 Hz |
@@ -290,10 +331,11 @@ the encoder and Wan base directories; each file's docstring has its command line
 python -m pytest -q tests
 ```
 
-Six tests; two import upstream code and are skipped when the submodule is not checked out.
+Seven tests; two import upstream code and are skipped when the submodule is not checked out.
 
 ## Limitations
 
-- No robot comparison of task success for `phoenix_compile`, `phoenix_async` or `phoenix_rtc_infer`.
+- No robot comparison of task success for `phoenix_compile`, `phoenix_frame_cache`, `phoenix_async` or
+  `phoenix_rtc_infer`.
 - The normalization statistics step is not included.
 - Tied to one upstream commit and to a 14-D dual-arm joint layout with three cameras.

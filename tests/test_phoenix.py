@@ -411,6 +411,142 @@ def test_phoenix_compile_wraps_each_block_and_goes_back_to_eager(monkeypatch, tm
     assert calls[1:] == [(1, 9, 3, 4, 4), (1, 9, 3, 4, 4), (1, 1, 3, 4, 4)]  # anything else: as upstream
 
 
+def test_phoenix_frame_cache_gives_the_full_forwards_result_from_the_kept_current_frame(monkeypatch, tmp_path):
+    """phoenix_worker.FrameCache on a small stand-in of upstream's MoT (same hooks, same joint96 mask): a step whose
+    current-frame inputs are the kept ones runs on the future and action tokens only and gives what the full forward
+    gives; a new frame, a masked token or a backward pass runs in full; uninstalled, upstream's methods are back.
+    The adapter passes phoenix_frame_cache on as --frame-cache."""
+    import torch  # noqa: PLC0415
+
+    monkeypatch.syspath_prepend(str(REPO_ROOT))
+    adapter = importlib.import_module("policy.phoenix.deploy_policy")
+    worker = importlib.import_module("policy.phoenix.phoenix_worker")
+    (tmp_path / "config.yaml").write_text("{}")
+    assert adapter.worker_command({"checkpoint_dir": str(tmp_path), "phoenix_frame_cache": True}, "python")[-1] == (
+        "--frame-cache")  # fmt: skip
+    assert "--frame-cache" not in adapter.worker_command({"checkpoint_dir": str(tmp_path)}, "python")
+    assert worker.parse_args(["--run-dir", "x", "--frame-cache"]).frame_cache
+
+    dim, per_frame, frames, actions, layers = 5, 2, 3, 3, 3
+    video_len = per_frame * frames
+    torch.manual_seed(0)
+
+    class Block(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.q, self.k, self.v, self.o = (torch.nn.Linear(dim, dim).double() for _ in range(4))
+            self.c = torch.nn.Linear(dim, dim).double()
+
+    class Expert(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.blocks = torch.nn.ModuleList(Block() for _ in range(layers))
+
+    class MoT(torch.nn.Module):
+        expert_order = ["video", "action"]
+        num_layers = layers
+
+        def __init__(self):
+            super().__init__()
+            self.mixtures = torch.nn.ModuleDict({"video": Expert(), "action": Expert()})
+            self.block_masks = []
+
+        def _build_expert_attention_io(self, expert, block, x, freqs, t_mod):
+            h = x * (1 + t_mod[..., 0, :] if t_mod.ndim == 4 else 1 + t_mod)
+            return block.q(h) * freqs[:, :, 0], block.k(h) * freqs[:, :, 0], block.v(h), x, None, None, None, None, False
+
+        def _build_flex_block_mask(self, *, attention_mask, batch_size, query_len, key_len, device):
+            self.block_masks.append((query_len, key_len))
+            return attention_mask.clone()
+
+        def _mixed_attention(self, q_cat, k_cat, v_cat, attention_mask, flex_block_mask=None, flex_key_mask=None,
+                             query_mask=None, allow_self_when_all_masked=False, force_sdpa=False):  # fmt: skip
+            mask = attention_mask if flex_block_mask is None else flex_block_mask
+            assert tuple(mask.shape) == (q_cat.shape[1], k_cat.shape[1])
+            scores = (q_cat @ k_cat.transpose(1, 2)).masked_fill(~mask, float("-inf"))
+            return scores.softmax(-1) @ v_cat
+
+        def forward(self, embeds_all, attention_mask, freqs_all, context_all, t_mod_all, key_masks_all=None,
+                    query_masks_all=None):  # fmt: skip
+            tokens = dict(embeds_all)
+            assert attention_mask.shape[0] == attention_mask.shape[1] == sum(t.shape[1] for t in tokens.values())
+            for layer in range(self.num_layers):
+                io = {name: self._build_expert_attention_io(expert=self.mixtures[name], block=self.mixtures[name].blocks[layer],
+                                                            x=tokens[name], freqs=freqs_all[name], t_mod=t_mod_all[name])
+                      for name in self.expert_order}  # fmt: skip
+                mixed = self._mixed_attention(
+                    q_cat=torch.cat([io[n][0] for n in self.expert_order], 1),
+                    k_cat=torch.cat([io[n][1] for n in self.expert_order], 1),
+                    v_cat=torch.cat([io[n][2] for n in self.expert_order], 1), attention_mask=attention_mask,
+                    flex_block_mask=None, flex_key_mask=None, query_mask=None, force_sdpa=False)  # fmt: skip
+                start = 0
+                for name in self.expert_order:
+                    block, length = self.mixtures[name].blocks[layer], tokens[name].shape[1]
+                    context = context_all[name]  # the text rows each token may read
+                    read = (context["mask"].double() @ block.c(context["context"])) / context["mask"].shape[-1]
+                    tokens[name] = tokens[name] + block.o(mixed[:, start : start + length]) + read
+                    start += length
+            return tokens
+
+    model = type("Model", (), {})()
+    model.mot = mot = MoT()
+    total = video_len + actions
+    mask = torch.zeros(total, total, dtype=torch.bool)  # upstream's joint96 mask
+    mask[:per_frame, :per_frame] = True
+    mask[per_frame:video_len, :video_len] = True
+    mask[video_len:, :] = True
+
+    def inputs(current, future, action, step):
+        video_t = torch.cat([torch.zeros(1, per_frame, 6, dim), torch.full((1, video_len - per_frame, 6, dim), 0.1 * step)], 1)
+        return {
+            "embeds_all": {"video": torch.cat([current, future], 1), "action": action},
+            "attention_mask": mask.clone(),
+            "freqs_all": {"video": freqs["video"], "action": freqs["action"]},
+            "context_all": {"video": {"context": text, "mask": context_mask["video"]},
+                            "action": {"context": text, "mask": context_mask["action"]}},
+            "t_mod_all": {"video": video_t.double(), "action": torch.full((1, dim), 0.1 * step).double()},
+            "key_masks_all": {"video": torch.ones(1, video_len, dtype=torch.bool), "action": torch.ones(1, actions, dtype=torch.bool)},
+            "query_masks_all": {"video": torch.ones(1, video_len, dtype=torch.bool), "action": torch.ones(1, actions, dtype=torch.bool)},
+        }  # fmt: skip
+
+    rand = lambda *shape: torch.randn(*shape, dtype=torch.float64)  # noqa: E731
+    freqs = {"video": rand(1, video_len, 1, dim), "action": rand(1, actions, 1, dim)}
+    text = rand(1, 4, dim)
+    context_mask = {"video": torch.rand(1, video_len, 4) > 0.3, "action": torch.rand(1, actions, 4) > 0.3}
+    current = rand(1, per_frame, dim)
+    steps = [inputs(current, rand(1, video_len - per_frame, dim), rand(1, actions, dim), k) for k in (5, 4, 3)]
+    assert worker.FrameCache.current_tokens(mask, video_len) == per_frame
+    assert worker.FrameCache.current_tokens(torch.ones(total, total, dtype=torch.bool), video_len) == 0
+
+    with torch.no_grad():
+        full = [mot(**step) for step in steps]
+        cache = worker.FrameCache(model).install()
+        got = [mot(**step) for step in steps]
+        assert cache.counts == {"full": 1, "cached": 2} and len(cache.keys) == layers
+        assert mot.block_masks == [(total - per_frame, total)]  # one mask for the live queries over every key
+        for a, b in zip(full, got, strict=True):
+            assert a["video"].shape == b["video"].shape == (1, video_len, dim)
+            assert torch.allclose(a["video"], b["video"], atol=1e-10) and torch.allclose(a["action"], b["action"], atol=1e-10)
+
+        other = inputs(rand(1, per_frame, dim), steps[0]["embeds_all"]["video"][:, per_frame:], steps[0]["embeds_all"]["action"], 5)
+        expected = MoT.forward(mot, **other)
+        again = mot(**other)  # a new current frame: in full, and the cache is its
+        assert cache.counts == {"full": 2, "cached": 2} and torch.allclose(again["video"], expected["video"], atol=1e-10)
+        padded = {**steps[1], "embeds_all": {**other["embeds_all"]}}
+        padded["key_masks_all"] = {**padded["key_masks_all"], "video": torch.zeros(1, video_len, dtype=torch.bool)}
+        mot(**padded)  # a masked token: never from the cache
+        assert cache.counts["cached"] == 2
+    with torch.enable_grad():  # a backward pass (RTC guidance) goes through upstream's forward as it is
+        before = dict(cache.counts)
+        mot(**steps[0])
+        assert cache.counts == before
+    cache.uninstall()
+    for name in ("forward", "_build_expert_attention_io", "_mixed_attention"):
+        assert name not in vars(mot)
+    with torch.no_grad():
+        assert torch.equal(mot(**steps[2])["action"], full[2]["action"])
+
+
 def test_phoenix_inpainting_holds_the_known_steps_and_leaves_the_others_as_upstream(monkeypatch):
     """phoenix_worker.InpaintScheduler around upstream's flow-matching scheduler: the known steps come out exactly
     (weight 1), the free ones bit for bit as upstream's Euler steps; RTC's soft mask decays to 0 by the last known."""

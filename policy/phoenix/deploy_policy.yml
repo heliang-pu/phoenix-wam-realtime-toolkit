@@ -89,6 +89,13 @@ phoenix_rtc_beta: 5.0
 # at start (about 15-20 s). The chunks differ from the eager ones by rounding carried through the denoising, about a
 # tenth of what a new noise seed changes (see the README). RTC guidance runs its own forward eagerly.
 phoenix_compile: false
+# The current frame's part of the trunk once per inference instead of once per denoising step
+# (phoenix_worker.FrameCache). The current frame's tokens (a third of the video tokens) attend only to themselves and
+# stay at timestep 0, so their keys and values are the same in every step: the first step keeps them, the others run
+# on the future and action tokens. A step runs from the cache only when its current-frame inputs equal the kept ones
+# bit for bit; anything else (a padded camera, RTC guidance's backward pass) runs in full. Rounding-level differences
+# like phoenix_compile's; the two add up in speed (see the README).
+phoenix_frame_cache: false
 # cache: the run's T5 rows (the trained prompts only); gpu: load umT5-XXL and encode any prompt.
 phoenix_text_encoder: cache
 # Trained on gripper opening fractions (0 closed, 1 open); the environment takes metres per finger.

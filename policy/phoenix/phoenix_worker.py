@@ -72,6 +72,8 @@ def parse_args(argv=None):
     p.add_argument("--denoise-steps", type=int, default=5, help="of both the future video and the actions")
     p.add_argument("--seed", type=int, default=0, help="noise seed of every chunk (upstream: 0); negative: fresh noise")
     p.add_argument("--text-encoder", choices=("cache", "gpu"), default="cache")
+    p.add_argument("--frame-cache", action="store_true",
+                   help="the current frame's trunk tokens computed once per inference, not per denoising step (FrameCache)")  # fmt: skip
     p.add_argument("--compile", choices=("off", "default"), default="off",
                    help="torch.compile around each MoT block's two halves and the DINO backbone, repeated frames "
                         "encoded once (compile_trunk, compile_encoder): fewer, fused small operators")  # fmt: skip
@@ -239,6 +241,175 @@ def restore_trunk(model) -> dict:
     return taken
 
 
+class FrameCache:
+    """The current frame's part of the trunk computed once per inference instead of once per denoising step.
+
+    In joint96 the video sequence is [current frame, noisy future] and upstream's mask (build_joint96_attention_mask)
+    lets the current frame's tokens attend only to themselves; their timestep is 0 at every step. So their hidden
+    states, and the keys and values the other tokens read from them, are the same in all denoising steps of an
+    inference, a third of the video tokens. Installed, the first MoT call of an inference runs as upstream's and keeps
+    each layer's keys and values of those tokens; a later call whose current-frame inputs are bit for bit the kept
+    ones (tokens, time modulation, RoPE, text context) runs upstream's own forward on the future and action tokens
+    only, and the mixed attention is given the kept keys and values in front of theirs, under the same rows of
+    upstream's mask. Any other call -- a new frame, a padded camera, other shapes -- runs in full and renews the
+    cache. The kernels see other shapes, so the result differs from the full forward by rounding, as with
+    compile_trunk. Upstream has this idea for a whole static video (kv_cache.py), not for part of the video expert."""
+
+    def __init__(self, model):
+        self.model, self.mot = model, model.mot
+        self.ref = self.keys = self.values = self.current_out = None
+        self.layer, self.capturing, self.cached_step, self.n = 0, False, False, 0
+        self.full_mask = self.block = self.block_shape = None
+        self.counts = {"full": 0, "cached": 0}
+
+    def install(self) -> "FrameCache":
+        mot = self.mot
+        self.forward, self.build, self.mixed = mot.forward, mot._build_expert_attention_io, mot._mixed_attention  # noqa: SLF001
+        mot.forward, mot._build_expert_attention_io, mot._mixed_attention = self._forward, self._build, self._mixed  # noqa: SLF001
+        mot._phoenix_frame_cache = self  # noqa: SLF001
+        return self
+
+    def uninstall(self) -> None:
+        mot = self.mot
+        if getattr(mot, "_phoenix_frame_cache", None) is self:
+            mot.forward, mot._build_expert_attention_io, mot._mixed_attention = self.forward, self.build, self.mixed  # noqa: SLF001
+            for name in ("forward", "_build_expert_attention_io", "_mixed_attention"):
+                if getattr(type(mot), name, None) is getattr(getattr(mot, name), "__func__", None):
+                    delattr(mot, name)  # the class's own method again
+            del mot._phoenix_frame_cache  # noqa: SLF001
+        self.ref = self.keys = self.values = self.current_out = None
+
+    @staticmethod
+    def current_tokens(mask: torch.Tensor, video_len: int) -> int:
+        """How many leading video tokens attend only to themselves and are attended in full (0: no such block)."""
+        if mask.ndim != 2 or mask.shape[0] != mask.shape[1]:
+            return 0
+        row = mask[0]
+        n = int(row.long().sum().item())
+        if not 0 < n < video_len or not bool(row[:n].all().item()):
+            return 0
+        if not bool(mask[:n, :n].all().item()) or bool(mask[:n, n:].any().item()):
+            return 0
+        return n
+
+    @staticmethod
+    def _split(tensor, length: int, n: int, first: bool):
+        """``tensor`` cut along its axis of the video sequence's ``length``: the first ``n`` or the rest. That axis is
+        axis 1 ([B, S, ...]) when it has the length, else the only axis that has. A tensor without such an axis is the
+        same for every token and comes back whole; several candidates elsewhere: ValueError."""
+        if tensor is None:
+            return None
+        axes = [axis for axis, size in enumerate(tensor.shape) if size == length]
+        if not axes:
+            return tensor
+        if 1 in axes:
+            axes = [1]
+        if len(axes) > 1:
+            raise ValueError(f"which axis of {tuple(tensor.shape)} is the video sequence of length {length}?")
+        return tensor.narrow(axes[0], 0, n) if first else tensor.narrow(axes[0], n, length - n)
+
+    def _parts(self, kwargs, n, first: bool):
+        """The video expert's inputs for its first ``n`` tokens, or for the others: tokens, time modulation, RoPE,
+        text context, context mask."""
+        length = int(kwargs["embeds_all"]["video"].shape[1])
+        context = kwargs["context_all"].get("video") or {}
+        return (self._split(kwargs["embeds_all"]["video"], length, n, first),
+                self._split(kwargs["t_mod_all"]["video"], length, n, first),
+                self._split(kwargs["freqs_all"]["video"], length, n, first),
+                context.get("context"), self._split(context.get("mask"), length, n, first))  # fmt: skip
+
+    def _same(self, inputs, mask, valid) -> bool:
+        """The kept inputs and mask are these, bit for bit, and no token is masked out (one GPU round trip)."""
+        if self.ref is None or self.full_mask.shape != mask.shape:
+            return False
+        checks = [(self.full_mask == mask).all(), *(m.all() for m in valid)]
+        for kept, now in zip(self.ref, inputs, strict=True):
+            if (kept is None) != (now is None):
+                return False
+            if kept is not None:
+                if kept.shape != now.shape or kept.dtype != now.dtype:
+                    return False
+                checks.append((kept == now).all())
+        return bool(torch.stack(checks).all().item())
+
+    def _forward(self, *args, **kwargs):
+        if args or set(kwargs) - {"embeds_all", "attention_mask", "freqs_all", "context_all", "t_mod_all",
+                                  "key_masks_all", "query_masks_all"} or torch.is_grad_enabled():  # fmt: skip
+            return self.forward(*args, **kwargs)  # captures, a profiler, a backward pass: upstream's path as it is
+        mask, video = kwargs["attention_mask"], kwargs["embeds_all"]["video"]
+        valid = [m for masks in (kwargs.get("key_masks_all"), kwargs.get("query_masks_all")) if masks
+                 for m in masks.values() if m is not None]  # fmt: skip
+        if mask is None or mask.ndim != 2 or list(self.mot.expert_order) != ["video", "action"]:
+            self.ref = None
+            return self.forward(**kwargs)
+        try:
+            if self.ref is not None and self._same(self._parts(kwargs, self.n, first=True), mask, valid):
+                return self._cached(kwargs, self.n)
+            n = self.current_tokens(mask, int(video.shape[1]))
+            if n == 0 or not all(bool(m.all().item()) for m in valid):
+                raise ValueError("no current-frame block, or masked tokens")
+            inputs = self._parts(kwargs, n, first=True)
+        except ValueError:
+            self.ref = None
+            return self.forward(**kwargs)
+        total, batch = int(mask.shape[0]), int(video.shape[0])
+        if self.block is None or self.block_shape != (batch, total, n) or not torch.equal(self.full_mask, mask):
+            # the live queries' rows over every key, the kept ones first: one block mask for all layers and steps
+            self.block = self.mot._build_flex_block_mask(  # noqa: SLF001
+                attention_mask=mask[n:], batch_size=batch, query_len=total - n, key_len=total, device=video.device)  # fmt: skip
+            self.block_shape = (batch, total, n)
+        self.ref, self.n, self.full_mask = tuple(None if t is None else t.clone() for t in inputs), n, mask.clone()
+        self.keys, self.values, self.capturing = [], [], True
+        try:
+            out = self.forward(**kwargs)
+        finally:
+            self.capturing = False
+        if len(self.keys) != self.mot.num_layers:
+            self.ref = None  # upstream's forward did not go through the hooks as expected: no cache
+        else:
+            self.current_out = out["video"][:, :n].clone()
+        self.counts["full"] += 1
+        return out
+
+    def _cached(self, kwargs, n):
+        tokens, t_mod, freqs, _context, context_mask = self._parts(kwargs, n, first=False)
+        context = kwargs["context_all"].get("video")
+        live = dict(kwargs)
+        live["embeds_all"] = {**kwargs["embeds_all"], "video": tokens}
+        live["freqs_all"] = {**kwargs["freqs_all"], "video": freqs}
+        live["t_mod_all"] = {**kwargs["t_mod_all"], "video": t_mod}
+        if context is not None:
+            live["context_all"] = {**kwargs["context_all"], "video": {**context, "mask": context_mask}}
+        for name in ("key_masks_all", "query_masks_all"):
+            if kwargs.get(name) and kwargs[name].get("video") is not None:
+                live[name] = {**kwargs[name], "video": kwargs[name]["video"][:, n:]}
+        live["attention_mask"] = self.full_mask[n:, n:]  # square, for upstream's own checks; _mixed uses the full rows
+        self.layer, self.cached_step = 0, True
+        try:
+            out = self.forward(**live)
+        finally:
+            self.cached_step = False
+        self.counts["cached"] += 1
+        return {**out, "video": torch.cat([self.current_out.to(out["video"].dtype), out["video"]], dim=1)}
+
+    def _build(self, expert, block, x, freqs, t_mod):
+        result = self.build(expert=expert, block=block, x=x, freqs=freqs, t_mod=t_mod)
+        if self.capturing and expert is self.mot.mixtures["video"]:
+            self.keys.append(result[1][:, : self.n].clone())
+            self.values.append(result[2][:, : self.n].clone())
+        return result
+
+    def _mixed(self, q_cat, k_cat, v_cat, attention_mask, **kwargs):
+        if not self.cached_step:
+            return self.mixed(q_cat=q_cat, k_cat=k_cat, v_cat=v_cat, attention_mask=attention_mask, **kwargs)
+        layer = self.layer
+        self.layer += 1
+        keys = torch.cat([self.keys[layer], k_cat], dim=1)
+        values = torch.cat([self.values[layer], v_cat], dim=1)
+        return self.mixed(q_cat=q_cat, k_cat=keys, v_cat=values, attention_mask=self.full_mask[self.n :],
+                          flex_block_mask=self.block, flex_key_mask=None, query_mask=None, force_sdpa=False)  # fmt: skip
+
+
 class RtcGuidance:
     """Inference-time RTC (Black et al. 2025, arXiv 2506.07339) around upstream's joint denoising loop, one inference.
 
@@ -277,6 +448,9 @@ class RtcGuidance:
     def __enter__(self):
         expert, mot = self.model.action_expert, self.model.mot
         self.pre_dit, self.post_dit, self.mot_forward = expert.pre_dit, expert.post_dit, mot.forward
+        # what was patched over them already (FrameCache's forward) comes back as it was
+        self.patched = [(owner, name, vars(owner).get(name))
+                        for owner, name in ((expert, "pre_dit"), (expert, "post_dit"), (mot, "forward"))]  # fmt: skip
         expert.pre_dit, expert.post_dit, mot.forward = self._pre_dit, self._post_dit, self._mot_forward
         self.compiled = restore_trunk(self.model)  # --compile: the guided forward and its backward run eagerly
         self.flex_attention, options = mot._flex_attention, getattr(mot, "flex_training_kernel_options", None)  # noqa: SLF001
@@ -289,8 +463,12 @@ class RtcGuidance:
         return self
 
     def __exit__(self, *exc):
-        expert, mot = self.model.action_expert, self.model.mot
-        del expert.pre_dit, expert.post_dit, mot.forward  # the instance attributes: the class methods are back
+        mot = self.model.mot
+        for owner, name, before in self.patched:
+            if before is None:
+                delattr(owner, name)  # the instance attribute: the class method is back
+            else:
+                setattr(owner, name, before)
         mot._flex_attention = self.flex_attention  # noqa: SLF001
         for name, function in self.compiled.items():
             setattr(mot, name, function)
@@ -402,6 +580,9 @@ class Runtime:
         if args.compile != "off":
             print(f"[phoenix] --compile: {compile_trunk(self.model)} MoT blocks; encoder: "
                   f"{compile_encoder(self.model)}; compiled at the first inference", file=sys.stderr, flush=True)  # fmt: skip
+        self.frame_cache = FrameCache(self.model).install() if args.frame_cache else None
+        if self.frame_cache is not None:
+            print("[phoenix] --frame-cache: the current frame's trunk tokens once per inference", file=sys.stderr, flush=True)
         self.action_pad = self.static_pad("action").unsqueeze(0).to(self.device)
         self.state_pad = self.static_pad("state").unsqueeze(0).to(self.device)
         self.contexts = {}
@@ -437,7 +618,7 @@ class Runtime:
                 "replan_steps": self.args.replan_steps, "denoise_steps": self.args.denoise_steps,
                 "seed": self.args.seed, "text_encoder": self.args.text_encoder, "current_visual": self.visual["mode"],
                 "decode_video": self.args.decode_video, "rtc_prefix": False, "inpaint": True, "rtc_guidance": True,
-                "compile": self.args.compile,
+                "compile": self.args.compile, "frame_cache": bool(self.args.frame_cache),
                 "relative_dims": self.relative_dims}  # fmt: skip
 
     def rgb(self, obs):

@@ -263,6 +263,10 @@ def worker_command(usr_args: dict, python_bin: str) -> list[str]:
         if script != "phoenix_worker.py":
             raise ValueError("phoenix_compile is for post-train runs (phoenix_worker.py), not a Training RTC run")
         cmd += ["--compile", "default"]  # torch.compile around the MoT blocks (phoenix_worker.compile_trunk)
+    if str(usr_args.get("phoenix_frame_cache", False)).lower() in ("true", "1", "yes"):
+        if script != "phoenix_worker.py":
+            raise ValueError("phoenix_frame_cache is for post-train runs (phoenix_worker.py), not a Training RTC run")
+        cmd += ["--frame-cache"]  # the current frame's trunk tokens once per inference (phoenix_worker.FrameCache)
     return cmd
 
 
@@ -399,7 +403,7 @@ class PhoenixClient:
                 print(f"[phoenix] async: s + 2 d = {steps + 2 * delay} > {ACTION_HORIZON}: every chunk ends "
                       f"{steps + 2 * delay - ACTION_HORIZON} steps before the next takes over (the arm holds its last "
                       "target meanwhile); lower phoenix_steps", flush=True)  # fmt: skip
-        if self.info.get("compile", "off") != "off":
+        if self.info.get("compile", "off") != "off":  # (with phoenix_frame_cache: its second token shape too)
             took = self._warm_up()
             print("[phoenix] compiled trunk: " + ("no phoenix_prompt to warm up with, the first inference compiles"
                                                   if took is None else f"warmed up in {took:.1f} s"), flush=True)  # fmt: skip

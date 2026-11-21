@@ -57,9 +57,10 @@ SETTINGS = [
                               "phoenix_rtc_infer": "inpaint"}),
     ("async s10 d10 guidance", {"phoenix_steps": 10, "phoenix_async": "real", "phoenix_inference_delay": 10,
                                 "phoenix_rtc_infer": "guidance"}),
-    ("sync s20 compile", {"phoenix_steps": 20, "phoenix_compile": True}),
-    ("async s14 d6 inpaint compile", {"phoenix_steps": 14, "phoenix_async": "real", "phoenix_inference_delay": 6,
-                                      "phoenix_rtc_infer": "inpaint", "phoenix_compile": True}),
+    ("sync s20 compile + frame cache", {"phoenix_steps": 20, "phoenix_compile": True, "phoenix_frame_cache": True}),
+    ("async s14 d6 inpaint compile + frame cache", {
+        "phoenix_steps": 14, "phoenix_async": "real", "phoenix_inference_delay": 6, "phoenix_rtc_infer": "inpaint",
+        "phoenix_compile": True, "phoenix_frame_cache": True}),
 ]
 for name, extra in SETTINGS:
     usr = {"checkpoint_dir": run_dir, "phoenix_step": int(step), "phoenix_python": python, "phoenix_prompt": prompt,
