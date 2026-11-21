@@ -1,0 +1,123 @@
+# Phoenix-MWA policy adapter configuration (deploy_policy.py reads the phoenix_* keys; the keys above them are the
+# evaluation harness's own).
+#
+# The model runs in phoenix_worker.py under Phoenix's own interpreter ($WS_ROOT/venvs/phoenix); the adapter process
+# only drives the simulator or the robot.
+
+policy_name: phoenix
+task_name: click_bell
+setting: clear
+model_name: phoenix
+seed: 0
+max_episodes: 1
+max_steps: 1000
+headless: true
+device: cpu
+renderer: hybrid
+gpu_id: 0
+num_envs: 1
+filter_dataset_saving: true
+eval_video_log: false
+eval_video_obs_key: cam_high
+
+# A Phoenix training output dir or a copy of it: config.yaml, dataset_stats.json, checkpoints/weights/slot_*.pt +
+# weights_manifest.json, embodiment_registry.json and text_cache/ (here or one level up). Relative paths resolve
+# against the repo root. phoenix_step picks a saved step (0 = the latest).
+checkpoint_dir: ""
+phoenix_step: 0
+# csvae.pt + dino110k.pt, and the Wan2.2 VAE / tokenizer base (DIFFSYNTH_MODEL_BASE_PATH); empty = config's paths.
+phoenix_encoders: ""
+phoenix_wan_base: ""
+
+# Worker interpreter; empty = $PHOENIX_PYTHON, else $WS_ROOT/venvs/phoenix/bin/python.
+phoenix_python: ""
+# CUDA mask for the worker only (default gpu_id).
+phoenix_cuda_visible_devices: 0
+
+# Env steps executed per inference (<= the 32-step chunk); 10 is upstream's RoboTwin protocol.
+phoenix_steps: 10
+# Denoising steps of both the future video and the actions (one schedule). The worker does not decode the predicted
+# frames (deployment never reads them; the actions are the same), which nearly halves the time of an inference.
+# Fewer steps are faster but the targets reverse direction more often from step to step.
+phoenix_denoise_steps: 5
+# Noise seed of every chunk, as upstream's eval (0); -1 = fresh noise every chunk.
+phoenix_seed: -1
+# Stalls: the model sees one frame, and with a fixed seed every chunk has the same noise, so where it predicts "wait"
+# it gets the same frame back and waits again. > 0: a chunk requested after no progress over this many env steps
+# (every joint within 0.02 rad, grippers within 0.05) counts as stalled (logged per episode), and phoenix_stall_fix
+# draws it differently:
+#   none    counted only
+#   reseed  seed phoenix_seed + the stalled chunks in a row
+#   cover   cam_high black (the black frame goes in as a real view)
+#   mask    cam_high encoded as missing (camera_is_pad): what runs trained with fmc3.main_camera_mask_prob saw in that
+#           fraction of their samples
+# cover and mask last phoenix_stall_cover_chunks chunks, then one chunk as is, and again while there is no progress.
+phoenix_stall_steps: 30
+phoenix_stall_fix: cover
+phoenix_stall_cover_chunks: 2
+
+# Asynchronous chunks (upstream prometheus's H32 / s / d execution): off = compute a chunk, execute phoenix_steps of it,
+# compute the next (the arm stops for every inference). real = the next chunk is computed in the background once
+# phoenix_steps (s) of the running one have executed, from the observation then, and takes over after
+# phoenix_inference_delay (d) steps, while the arm keeps executing. A chunk runs from its index d to d + s + d, so
+# keep s + 2 d <= 32. The model plans from an observation d steps old, and a model not trained for it may not join its
+# chunks smoothly: compare with off before using it.
+phoenix_async: "off"
+phoenix_inference_delay: 6  # control steps one inference takes (model + pipe at the control rate), with some margin
+# Training RTC (prometheus branch, rtc_worker.py for a run dir with model.yaml): hand the model steps its chunk has to
+# continue. Only a checkpoint trained with Training RTC takes it (post-train ones are refused). With phoenix_async off
+# (serial inference) every chunk after an episode's first continues the phoenix_prefix_steps (d) targets the previous
+# chunk planned right after the phoenix_steps (s) it executed: the model holds them fixed and they are the new chunk's
+# first d steps (0 < d < s, s + d <= 32, d <= the trained maximum; no inpaint / bidN with it). With phoenix_async
+# real: the d steps the running chunk still executes while the next is computed.
+phoenix_rtc_prefix: false
+phoenix_prefix_steps: 4
+# RTC at inference (with phoenix_async real, any post-train checkpoint): a background chunk is drawn continuing the
+# running chunk's targets from its observation on -- the d that execute meanwhile at weight 1, the rest of them
+# (32 - s - 2 d; the first chunk's 32 - s - d) by RTC's soft mask.
+#   inpaint   by inpainting (phoenix_worker.InpaintScheduler), no extra inference time. Needs soft steps to work: with
+#             s + 2 d = 32 (s 20, d 6) the join only moves to the takeover; s 14, d 6 re-plans every 20 steps with 6.
+#   guidance  RTC's own algorithm (Black et al. 2025; upstream's _apply_rtc_guidance_to_action_velocity around the
+#             joint loop, phoenix_worker.RtcGuidance; phoenix_rtc_beta = its weight clip). One backward pass per
+#             denoising step: about twice the inference time, so a larger d. On the single-task checkpoints it was
+#             measured on it hardly moves the chunk (see the README).
+phoenix_rtc_infer: "off"
+phoenix_rtc_beta: 5.0
+# Faster inference without changing what is computed: torch.compile around each MoT block's two halves and around the
+# DINO backbone, so their small operators are fused, and the current frame's nine copies go through DINO once
+# (phoenix_worker.compile_trunk, compile_encoder). The worker compiles at its first inference; the adapter warms it up
+# at start (about 15-20 s). The chunks differ from the eager ones by rounding carried through the denoising, about a
+# tenth of what a new noise seed changes (see the README). RTC guidance runs its own forward eagerly.
+phoenix_compile: false
+# cache: the run's T5 rows (the trained prompts only); gpu: load umT5-XXL and encode any prompt.
+phoenix_text_encoder: cache
+# Trained on gripper opening fractions (0 closed, 1 open); the environment takes metres per finger.
+phoenix_gripper_scale: 0.05
+# phoenix_smooth (chunk_smoother.py): each chunk's arm joints smoothed before execution (grippers as predicted), for
+# low control rates without interpolation, where the model's step-to-step reversals show.
+#   none | gauss1 / gauss2 (local linear fit, the number = width in steps)
+#   bspline8 / bspline6 (least-squares cubic B-spline through the last phoenix_smooth_history commands and the chunk,
+#       that many control points per chunk)
+#   lipo1 / lipo2 (LiPo, arXiv 2506.05165): blend from the previous chunk's tail, then the smallest jerk with every
+#       joint at most 0.01 / 0.02 rad off the chunk
+#   inpaint<h>soft[<n>] (chunk_inpaint.py): each synchronous chunk drawn continuing the last one's tail (h steps
+#       exactly, then n -- default all -- by RTC's soft mask; needs phoenix_steps < 32), alone or with a smoother
+#       (inpaint2soft4+lipo1)
+# A value or {task: value, default: value}.
+phoenix_smooth: none
+phoenix_smooth_history: 8
+# phoenix_sampling: single | bid2 | bid3 (Bidirectional Decoding, arXiv 2408.17355): N chunks with different noise
+# seeds per inference (N times the inference time); the one that best continues the previous chunk's unexecuted tail
+# is executed.
+phoenix_sampling: single
+# phoenix_nudge: two chunks in a row planning almost no motion (inside the chunk and from the last command below
+# 0.01 rad, grippers still) -> the next chunk moves 0.03 rad along the last clear motion direction instead.
+phoenix_nudge: false
+# The trained prompts, word for word (the T5 cache is keyed by them); phoenix_prompt overrides. Replace these with
+# your own tasks' prompts.
+phoenix_prompt: ""
+phoenix_prompts:
+  click_bell: Click the bell
+  handle_basket: Pick the bottle then place it to the basket, carry the basket with the other arm.
+  items_handover: Pick up the pen, hand it over to the other arm and then place it in to the pen holder
+  water_pouring: Pick the cup and the bottle with the other arm, pour the water from bottle to cup

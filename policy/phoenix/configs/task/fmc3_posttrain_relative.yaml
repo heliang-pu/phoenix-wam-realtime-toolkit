@@ -1,0 +1,23 @@
+# @package _global_
+# fmc3_posttrain with relative joint actions: a[t+k] - s[t] on the 12 arm joints, grippers absolute, through
+# robosyn_transforms.RelativeJointTransform (the reader's state window starts at s[t], memory 0).
+# phoenix_worker.py adds s[t] back. Actions use q01/q99 normalization, the state keeps robotwin's z-score, so a parent
+# run's proprio input keeps its scale. The stats need relative_stats.py: the upstream stats tool aggregates q01/q99 as
+# the minimum / maximum over episodes, which is about the extreme of the deltas (2 rad per normalized unit against 0.5
+# for the absolute z-score); z-score instead clamps a tenth of the 32-step windows at +-5.
+#   PHOENIX_TASK=fmc3_posttrain_relative bash policy/phoenix/finetune.sh ...
+defaults:
+  - fmc3_posttrain
+  - _self_
+
+data:
+  train:
+    processor:
+      norm_exception_mode:
+        action:
+          default: q01/q99
+      action_state_transforms:
+      - _target_: robosyn_transforms.RelativeJointTransform
+        keys: [default]
+        dims: [0, 1, 2, 3, 4, 5, 7, 8, 9, 10, 11, 12]
+        num_frames: ${data.train.num_frames}

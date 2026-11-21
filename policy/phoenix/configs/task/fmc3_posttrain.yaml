@@ -1,0 +1,23 @@
+# @package _global_
+# A CobotMagic (dual PiPER, native joint14) on upstream's online-RGB recipe, new soft prompt slot 18
+# (fmc3_phoenix.py). Global batch 256 on 16 GPUs: 16 per GPU runs out of memory on an 80 GB card without gradient
+# checkpointing, so 8 per GPU x 2 accumulation; lr 5e-5.
+defaults:
+  - robotwin_posttrain
+  - override /data: fmc3_joint96_online
+  - _self_
+
+joint96_posttrain:
+  robotwin_softprompt:
+    enabled: true
+    embodiment_id: 18
+batch_size: 8
+gradient_accumulation_steps: 2
+num_epochs: 2
+learning_rate: 5.0e-5
+min_learning_rate: 5.0e-7
+# fmc3_phoenix.py: this fraction of training samples has the main camera (cam_high) marked missing through
+# upstream's main-camera augmentation input; 0 = off:
+# finetune.sh ... fmc3.main_camera_mask_prob=0
+fmc3:
+  main_camera_mask_prob: 0.1

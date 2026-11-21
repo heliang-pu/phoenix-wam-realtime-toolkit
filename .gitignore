@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+# upstream's prometheus branch, when checked out here for Training RTC
+policy/phoenix/Phoenix-MWA-prometheus/
+# local environments, weights, outputs
+.venv/
+venvs/
+models/
+*.pt
+*.safetensors
+*.npz

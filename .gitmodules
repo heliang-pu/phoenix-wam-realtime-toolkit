@@ -1,0 +1,4 @@
+[submodule "policy/phoenix/Phoenix-MWA"]
+	path = policy/phoenix/Phoenix-MWA
+	url = https://github.com/Anyverse-Dynamics/Phoenix-MWA.git
+	branch = post-train

@@ -1,0 +1,13 @@
+# @package data
+# Upstream's RoboTwin online-RGB data contract (three 480x640 cameras -> 256x256, joint14 -> canonical80, RGB jitter)
+# on another dataset: one LeRobot v2.1 root, all episodes, its own z-score stats, prompt-hashed T5 cache.
+defaults:
+  - robotwin_joint96_online_robot37
+  - _self_
+
+train:
+  dataset_dirs:
+  - ${oc.env:FMC3_DATA_ROOT}
+  pretrained_norm_stats: ${oc.env:FMC3_NORM_STATS}
+  text_embedding_cache_dir: ${oc.env:FMC3_TEXT_CACHE}
+  episode_selection: null
