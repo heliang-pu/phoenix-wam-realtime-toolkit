@@ -1,4 +1,4 @@
-# wam-toolkit
+# phoenix-wam-realtime-toolkit
 
 [English](README.md) | **中文**
 
@@ -42,7 +42,7 @@
   还可以下载公开的编码器、Wan 2.2 VAE 和预训练权重。
 
 ```bash
-git clone --recurse-submodules https://github.com/heliang-pu/wam-toolkit.git && cd wam-toolkit
+git clone --recurse-submodules https://github.com/heliang-pu/phoenix-wam-realtime-toolkit.git && cd phoenix-wam-realtime-toolkit
 bash policy/phoenix/setup_env.sh --download-inference --download-pretrain
 ```
 

@@ -1,4 +1,4 @@
-# wam-toolkit
+# phoenix-wam-realtime-toolkit
 
 **English** | [中文](README.zh-CN.md)
 
@@ -47,7 +47,7 @@ that chains tasks on top of a model like this one is in
   [uv](https://docs.astral.sh/uv/) and can download the public encoders, the Wan 2.2 VAE and the pretrained weights.
 
 ```bash
-git clone --recurse-submodules https://github.com/heliang-pu/wam-toolkit.git && cd wam-toolkit
+git clone --recurse-submodules https://github.com/heliang-pu/phoenix-wam-realtime-toolkit.git && cd phoenix-wam-realtime-toolkit
 bash policy/phoenix/setup_env.sh --download-inference --download-pretrain
 ```
 
