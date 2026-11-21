@@ -57,11 +57,12 @@ phoenix_stall_fix: cover
 phoenix_stall_cover_chunks: 2
 
 # Asynchronous chunks (upstream prometheus's H32 / s / d execution): off = compute a chunk, execute phoenix_steps of it,
-# compute the next (the arm stops for every inference). real = the next chunk is computed in the background once
-# phoenix_steps (s) of the running one have executed, from the observation then, and takes over after
-# phoenix_inference_delay (d) steps, while the arm keeps executing. A chunk runs from its index d to d + s + d, so
-# keep s + 2 d <= 32. The model plans from an observation d steps old, and a model not trained for it may not join its
-# chunks smoothly: compare with off before using it.
+# compute the next (the arm stops for every inference). real = the next chunk is computed in the background while the
+# arm keeps executing. phoenix_steps stays what it is with off, the steps of a chunk that are executed and so the
+# re-planning period: the next chunk is launched phoenix_inference_delay (d) steps before the running one has executed
+# phoenix_steps, from the observation then, and takes over d steps later (a chunk runs from its index d to
+# d + phoenix_steps). d < phoenix_steps <= 32 - d, anything else is refused. The model plans from an observation d
+# steps old, and a model not trained for it may not join its chunks smoothly: compare with off before using it.
 phoenix_async: "off"
 phoenix_inference_delay: 6  # control steps one inference takes (model + pipe at the control rate), with some margin
 # Training RTC (prometheus branch, rtc_worker.py for a run dir with model.yaml): hand the model steps its chunk has to
@@ -74,9 +75,9 @@ phoenix_rtc_prefix: false
 phoenix_prefix_steps: 4
 # RTC at inference (with phoenix_async real, any post-train checkpoint): a background chunk is drawn continuing the
 # running chunk's targets from its observation on -- the d that execute meanwhile at weight 1, the rest of them
-# (32 - s - 2 d; the first chunk's 32 - s - d) by RTC's soft mask.
+# (32 - phoenix_steps - d) by RTC's soft mask.
 #   inpaint   by inpainting (phoenix_worker.InpaintScheduler), no extra inference time. Needs soft steps to work: with
-#             s + 2 d = 32 (s 20, d 6) the join only moves to the takeover; s 14, d 6 re-plans every 20 steps with 6.
+#             phoenix_steps + d = 32 the join only moves to the takeover; phoenix_steps 20, d 6 leaves 6 soft steps.
 #   guidance  RTC's own algorithm (Black et al. 2025; upstream's _apply_rtc_guidance_to_action_velocity around the
 #             joint loop, phoenix_worker.RtcGuidance; phoenix_rtc_beta = its weight clip). One backward pass per
 #             denoising step: about twice the inference time, so a larger d. On the single-task checkpoints it was
@@ -88,6 +89,9 @@ phoenix_rtc_beta: 5.0
 # (phoenix_worker.compile_trunk, compile_encoder). The worker compiles at its first inference; the adapter warms it up
 # at start (about 15-20 s). The chunks differ from the eager ones by rounding carried through the denoising, about a
 # tenth of what a new noise seed changes (see the README). RTC guidance runs its own forward eagerly.
+# (The worker's --compile also takes trunk and encoder, only that one of the two, to tell their effects apart, and
+# reduce-overhead, CUDA graph replay with one graph-tree step per denoising step: the same chunks, but no speed-up
+# where it was measured and a much longer warm-up. This key selects none of them.)
 phoenix_compile: false
 # The current frame's part of the trunk once per inference instead of once per denoising step
 # (phoenix_worker.FrameCache). The current frame's tokens (a third of the video tokens) attend only to themselves and

@@ -74,9 +74,10 @@ def parse_args(argv=None):
     p.add_argument("--text-encoder", choices=("cache", "gpu"), default="cache")
     p.add_argument("--frame-cache", action="store_true",
                    help="the current frame's trunk tokens computed once per inference, not per denoising step (FrameCache)")  # fmt: skip
-    p.add_argument("--compile", choices=("off", "default"), default="off",
+    p.add_argument("--compile", choices=("off", "default", "reduce-overhead", "trunk", "encoder"), default="off",
                    help="torch.compile around each MoT block's two halves and the DINO backbone, repeated frames "
-                        "encoded once (compile_trunk, compile_encoder): fewer, fused small operators")  # fmt: skip
+                        "encoded once (compile_trunk, compile_encoder): fewer, fused small operators. trunk / encoder: "
+                        "only that one of the two, to tell their effects apart")  # fmt: skip
     p.add_argument(
         "--decode-video",
         action="store_true",
@@ -156,7 +157,7 @@ class InpaintScheduler:
         return (stepped.float() + correction).to(sample.dtype)
 
 
-def compile_trunk(model) -> int:
+def compile_trunk(model, mode: str = "default") -> int:
     """torch.compile around the two per-layer halves of upstream's MoT, for inference (upstream's own
     mot_compile_mode only applies while training: evaluation "uses the eager attention path").
 
@@ -175,6 +176,7 @@ def compile_trunk(model) -> int:
     post_block = type(mot)._apply_expert_post_block  # noqa: SLF001
     post_block = getattr(post_block, "__wrapped__", post_block)  # without upstream's timing decorator
     compiled_pre, compiled_post = {}, {}
+    options = {} if mode == "default" else {"mode": mode}
     for name in mot.expert_order:
         expert = mot.mixtures[name]
         for index, block in enumerate(expert.blocks):
@@ -189,8 +191,8 @@ def compile_trunk(model) -> int:
 
             pre_fn.__code__ = pre_fn.__code__.replace(co_name=f"phoenix_pre_{name}_{index}")
             post_fn.__code__ = post_fn.__code__.replace(co_name=f"phoenix_post_{name}_{index}")
-            compiled_pre[id(block)] = torch.compile(pre_fn, dynamic=False, fullgraph=False)
-            compiled_post[id(block)] = torch.compile(post_fn, dynamic=False, fullgraph=False)
+            compiled_pre[id(block)] = torch.compile(pre_fn, dynamic=False, fullgraph=False, **options)
+            compiled_post[id(block)] = torch.compile(post_fn, dynamic=False, fullgraph=False, **options)
 
     def build_dispatch(expert, block, x, freqs, t_mod):
         return compiled_pre[id(block)](x, freqs, t_mod)
@@ -201,6 +203,18 @@ def compile_trunk(model) -> int:
         return compiled_post[id(block)](residual_x, mixed_attn_out, gate_msa, shift_mlp, scale_mlp, gate_mlp, context, mask)
 
     mot._build_expert_attention_io, mot._apply_expert_post_block = build_dispatch, post_dispatch  # noqa: SLF001
+    if mode == "reduce-overhead":
+        # CUDA graphs: every compiled half is replayed as one graph instead of launching its kernels one by one. A
+        # graph's outputs live until the next "step" of the graph tree, which by default is the next call of any
+        # compiled function -- a layer calls one per expert, so the second call would free the first one's outputs.
+        # Marking the steps ourselves, one per MoT call (a denoising step), keeps a step's outputs together.
+        forward = mot.forward
+
+        def stepped_forward(*args, **kwargs):
+            torch.compiler.cudagraph_mark_step_begin()
+            return forward(*args, **kwargs)
+
+        mot.forward = stepped_forward
     return len(compiled_pre)
 
 
@@ -578,8 +592,11 @@ class Runtime:
         self.model.eval().requires_grad_(requires_grad=False)
         self.visual = configure_current_visual(self.model, "auto")
         if args.compile != "off":
-            print(f"[phoenix] --compile: {compile_trunk(self.model)} MoT blocks; encoder: "
-                  f"{compile_encoder(self.model)}; compiled at the first inference", file=sys.stderr, flush=True)  # fmt: skip
+            trunk = compile_trunk(self.model, "default" if args.compile == "trunk" else args.compile) \
+                if args.compile != "encoder" else 0  # fmt: skip
+            encoder = compile_encoder(self.model) if args.compile != "trunk" else "left as it is"
+            print(f"[phoenix] --compile {args.compile}: {trunk} MoT blocks; encoder: {encoder}; compiled at the first "
+                  "inference", file=sys.stderr, flush=True)  # fmt: skip
         self.frame_cache = FrameCache(self.model).install() if args.frame_cache else None
         if self.frame_cache is not None:
             print("[phoenix] --frame-cache: the current frame's trunk tokens once per inference", file=sys.stderr, flush=True)

@@ -149,6 +149,11 @@ def test_phoenix_rtc_at_inference_is_asked_of_the_worker_per_background_chunk(mo
         adapter.rtc_infer_mode("rtc")
     with pytest.raises(ValueError, match="set phoenix_async real"):
         adapter.PhoenixClient({"phoenix_rtc_infer": "inpaint", "checkpoint_dir": "/nowhere"})
+    # phoenix_steps is the re-planning period with phoenix_async too: longer than d, and period + d within the chunk
+    for steps, delay in ((6, 6), (28, 6)):
+        with pytest.raises(ValueError, match="phoenix_inference_delay < phoenix_steps"):
+            adapter.PhoenixClient({"phoenix_async": "real", "phoenix_steps": steps, "phoenix_inference_delay": delay,
+                                   "checkpoint_dir": "/nowhere"})  # fmt: skip
     with pytest.raises(ValueError, match="not both"):
         adapter.PhoenixClient({"phoenix_rtc_infer": "guidance", "phoenix_async": "real", "phoenix_rtc_prefix": True,
                                "checkpoint_dir": "/nowhere"})  # fmt: skip
@@ -195,9 +200,32 @@ def test_phoenix_rtc_at_inference_is_asked_of_the_worker_per_background_chunk(mo
     assert sent[-1].get("pad_cameras") == ["cam_high"] and "rtc" not in sent[-1] and "inpaint" not in sent[-1]
 
     label = client.describe_async()
-    assert (label["steps"], label["delay"], label["rtc_infer"], label["rtc_beta"]) == (14, 6, "guidance", 5.0)
+    assert (label["period"], label["steps"], label["delay"], label["rtc_infer"], label["rtc_beta"]) == (
+        20, 14, 6, "guidance", 5.0)  # fmt: skip
     client.timeline = None
     assert client.describe_async() is None
+
+
+def test_phoenix_steps_is_the_replanning_period_with_async_chunks_too(monkeypatch):
+    """set_execution_steps: the worker's steps with synchronous chunks; with phoenix_async the timeline's, the next
+    chunk launched d steps before the period is over."""
+    monkeypatch.syspath_prepend(str(REPO_ROOT))
+    adapter = importlib.import_module("policy.phoenix.deploy_policy")
+    sent = []
+    client = adapter.PhoenixClient.__new__(adapter.PhoenixClient)
+    client.__dict__.update(steps=20, timeline=None, serial=None, info={},
+                           _rpc=lambda payload: sent.append(payload) or {"ok": True, "info": {"replan_steps": 10}})  # fmt: skip
+    assert client.set_execution_steps(10) == 10
+    assert sent == [{"cmd": "set", "replan_steps": 10}]
+    with pytest.raises(ValueError, match="1..32"):
+        client.set_execution_steps(33)
+    client.timeline = adapter.AsyncChunks(steps=16, delay=6)  # async: the timeline, not the worker
+    assert client.execution_steps == 22 and client.execution_steps_max == 26  # the period: 16 of its own + 6
+    client.set_execution_steps(20)  # every 20 steps: launched after 14 of the running chunk's own
+    assert client.timeline.steps == 14 and client.execution_steps == 20
+    with pytest.raises(ValueError, match="7..26"):
+        client.set_execution_steps(6)  # no longer than one inference
+    assert len(sent) == 1
 
 
 def test_phoenix_rtc_guidance_wraps_upstreams_function_around_the_joint_loop(monkeypatch):
@@ -320,6 +348,8 @@ def test_phoenix_compile_wraps_each_block_and_goes_back_to_eager(monkeypatch, tm
     assert adapter.worker_key({"checkpoint_dir": str(tmp_path), "phoenix_compile": True}) != adapter.worker_key(
         {"checkpoint_dir": str(tmp_path)})  # fmt: skip
     assert worker.parse_args(["--run-dir", "x", "--compile", "default"]).compile == "default"
+    for part in ("trunk", "encoder", "reduce-overhead"):  # one of the two parts, or CUDA graph replay
+        assert worker.parse_args(["--run-dir", "x", "--compile", part]).compile == part
 
     names = []
 

@@ -166,7 +166,7 @@ The options are documented in `deploy_policy.yml`:
 
 | Option | What it does |
 |---|---|
-| `phoenix_steps` | Steps of each 32-step chunk executed before the next inference |
+| `phoenix_steps` | Steps of each 32-step chunk that are executed: the re-planning period, synchronous or not |
 | `phoenix_denoise_steps` | Denoising steps (video and actions share one schedule) |
 | `phoenix_seed` | Noise seed of every chunk; -1 draws fresh noise each time |
 | `phoenix_stall_steps`, `phoenix_stall_fix` | Detect chunks requested after no progress and draw them differently |
@@ -181,6 +181,10 @@ The options are documented in `deploy_policy.yml`:
 
 Two independent options: `phoenix_compile: true` (worker flag `--compile default`) and `phoenix_frame_cache: true`
 (`--frame-cache`). Nothing is quantized and no denoising step is removed.
+
+To tell the parts of `phoenix_compile` apart, the worker also takes `--compile trunk` (the MoT blocks only) and
+`--compile encoder` (the DINO backbone and the repeated frame only). Together with `--frame-cache` alone, that makes
+three single-acceleration settings to compare against none.
 
 ### Where the time goes
 
@@ -264,8 +268,11 @@ measured.
 
 ### Notes
 
-- `mode="reduce-overhead"` (CUDA graphs) does not work with this split: each layer calls one compiled function per
-  expert, and the second call invalidates the first one's outputs.
+- `--compile reduce-overhead` (CUDA graph replay) needs one thing with this split: each layer calls one compiled
+  function per expert, and by default the second call frees the first one's outputs. The worker therefore marks the
+  graph-tree steps itself, one per MoT call (`torch.compiler.cudagraph_mark_step_begin()`). It then gives the same
+  chunks, but on the RTX 4090 it was no faster than `--compile default` (the inference is bound by its matrix
+  products there, not by kernel launches) and the warm-up took about 100 s. `phoenix_compile` does not select it.
 - A first version of the frame cache compared the mask once per layer; those 120 GPU round trips per inference
   cancelled the whole gain. Checks that force a synchronization belong once per step, not per layer.
 - The adapter's side is not worth optimizing: encoding the observation, the npz file and the pipe take about 5 ms
@@ -276,9 +283,12 @@ measured.
 
 ## Asynchronous execution and joining chunks
 
-With `phoenix_async: real` the next chunk is computed in the background once `phoenix_steps` (s) of the running one
-have executed, and takes over `phoenix_inference_delay` (d) steps later. A chunk therefore runs from its index d to
-d + s + d: keep **s + 2d ≤ 32**. On the stand-in robot at 10 Hz a step took 0.12 s on average instead of 0.134 s,
+With `phoenix_async: real` the next chunk is computed in the background while the arm keeps executing.
+`phoenix_steps` keeps its meaning, the steps of each chunk that are executed, so it is the re-planning period: the
+next chunk is launched `phoenix_inference_delay` (d) steps before the running one has executed `phoenix_steps`, and
+takes over d steps later. A chunk therefore runs from its index d to d + `phoenix_steps`:
+**d < `phoenix_steps` ≤ 32 − d**, and the adapter refuses anything else. When a chunk is launched, the running one
+has 32 − `phoenix_steps` steps left. On the stand-in robot at 10 Hz a step took 0.12 s on average instead of 0.134 s,
 and no control period was missed.
 
 A plain asynchronous chunk does not know what the arm does meanwhile, so it may not start where the old one was
@@ -289,8 +299,8 @@ rest of the overlap by the soft mask of RTC ([Black et al., 2025](https://arxiv.
 - `guidance` is RTC's own algorithm: upstream's implementation of the guidance, put around the joint denoising loop
   it was not connected to. One backward pass per denoising step, about twice the inference time.
 
-Largest joint step at the takeover, median / maximum in rad, with s = 14 and d = 6 (18 steps of the running chunk
-left, 12 of them soft), on recorded frames of two tasks:
+Largest joint step at the takeover, median / maximum in rad, with `phoenix_steps` 14 and d = 6 (18 steps of the
+running chunk left, 12 of them soft), on recorded frames of two tasks:
 
 | | Task A (8 launches) | Task B (20 launches) |
 |---|---|---|
@@ -301,8 +311,10 @@ left, 12 of them soft), on recorded frames of two tasks:
 
 Two findings:
 
-- **`inpaint` needs soft steps.** With s = 20 and d = 6 the running chunk has only the 6 hard steps left, and the
-  jump simply moves to the takeover (0.092 / 0.280 on task A). To re-plan every 20 steps, use s = 14 and d = 6.
+- **`inpaint` needs soft steps**, 32 − `phoenix_steps` − d of them. With `phoenix_steps` 20 and d = 6 there are 6,
+  and it still works (task A 0.038 / 0.086 against 0.090 / 0.283 without joining, task B 0.018 / 0.069 against
+  0.035 / 0.252). With `phoenix_steps` 26 and d = 6 the running chunk has only the 6 hard steps left, and the jump
+  simply moves to the takeover (0.092 / 0.280 on task A).
 - **`guidance` hardly moves the chunk on these checkpoints.** The guidance term is proportional to how much the
   model's clean-action estimate follows its noisy action input, and here it barely does until the noise level is
   below 0.1: the cosine between the gradient and the error is within ±0.11 at the five steps used. With guidance

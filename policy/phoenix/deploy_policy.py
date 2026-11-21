@@ -343,8 +343,15 @@ class PhoenixClient:
         if self.rtc_infer != "off" and self.rtc_prefix:
             raise ValueError("one of phoenix_rtc_prefix (a Training RTC checkpoint) and phoenix_rtc_infer, not both")
         # d: control steps one inference takes (0.42 s of model + the pipe at 10 Hz: 6 leaves some margin)
-        self.timeline = AsyncChunks(self.steps, int(usr_args.get("phoenix_inference_delay", 6))) \
-            if self.async_mode != "off" else None  # fmt: skip
+        # phoenix_steps is the re-planning period here too: a chunk is launched d steps before the running one has
+        # executed phoenix_steps (its own index d to d + phoenix_steps; an episode's first: 0 to phoenix_steps)
+        self.timeline = None
+        if self.async_mode != "off":
+            delay = int(usr_args.get("phoenix_inference_delay", 6))
+            if not 0 < delay < self.steps <= ACTION_HORIZON - delay:
+                raise ValueError(f"phoenix_async needs phoenix_inference_delay < phoenix_steps <= {ACTION_HORIZON} - "
+                                 f"phoenix_inference_delay (phoenix_steps={self.steps}, delay={delay})")  # fmt: skip
+            self.timeline = AsyncChunks(self.steps - delay, delay)
         # synchronous Training RTC (inference and execution alternate): each chunk continues the
         # phoenix_prefix_steps targets the previous one planned after the ones it executed
         if self.rtc_prefix and self.timeline is None:
@@ -397,12 +404,9 @@ class PhoenixClient:
                   f"one planned after its {self.steps}", flush=True)  # fmt: skip
         if self.timeline is not None:
             steps, delay = self.timeline.steps, self.timeline.delay
-            print(f"[phoenix] async: s={steps} d={delay} "
+            print(f"[phoenix] async: a new chunk every {steps + delay} steps (launched after {steps} of the running "
+                  f"one's own, d={delay} while it is computed), "
                   f"prefix={'committed steps (Training RTC)' if self.rtc_prefix else 'none'}", flush=True)  # fmt: skip
-            if steps + 2 * delay > ACTION_HORIZON:  # a chunk runs from its index d to d + s + d
-                print(f"[phoenix] async: s + 2 d = {steps + 2 * delay} > {ACTION_HORIZON}: every chunk ends "
-                      f"{steps + 2 * delay - ACTION_HORIZON} steps before the next takes over (the arm holds its last "
-                      "target meanwhile); lower phoenix_steps", flush=True)  # fmt: skip
         if self.info.get("compile", "off") != "off":  # (with phoenix_frame_cache: its second token shape too)
             took = self._warm_up()
             print("[phoenix] compiled trunk: " + ("no phoenix_prompt to warm up with, the first inference compiles"
@@ -479,7 +483,8 @@ class PhoenixClient:
         print(f"[phoenix] RTC at inference ({self.rtc_infer}): a background chunk continues the running one, its next "
               f"{delay} steps at weight 1 and {soft} more by the soft mask (the first chunk's: "
               f"{max(0, ACTION_HORIZON - steps - delay)})"
-              + ("" if soft else "; no soft steps: the join moves to the takeover, lower phoenix_steps"), flush=True)  # fmt: skip
+              + ("" if soft else "; no soft steps: the join moves to the takeover, lower phoenix_steps (the period)"),
+              flush=True)  # fmt: skip
         if self.rtc_infer != "guidance":
             return
         took = self._warm_up(rtc={"prev": np.zeros((delay + 1, 14)).tolist(), "delay": delay, "beta": self.rtc_beta})
@@ -722,7 +727,8 @@ class PhoenixClient:
         """What an episode's label records as policy_async (None: synchronous chunks)."""
         if getattr(self, "timeline", None) is None:
             return None
-        described = {"steps": self.timeline.steps, "delay": self.timeline.delay, "rtc_infer": self.rtc_infer,
+        described = {"period": self.timeline.steps + self.timeline.delay, "steps": self.timeline.steps,
+                     "delay": self.timeline.delay, "rtc_infer": self.rtc_infer,
                      "rtc_prefix": bool(getattr(self, "rtc_prefix", False)), "launches": self.timeline.launches,
                      "late": self.timeline.late, "delays": [int(d) for d in self.timeline.delays]}  # fmt: skip
         if self.rtc_infer == "guidance":
@@ -753,8 +759,9 @@ class PhoenixClient:
 
     @property
     def execution_steps(self) -> int:
-        """Steps of each chunk executed before the next inference (phoenix_steps)."""
-        return self.timeline.steps if self.timeline is not None else self.steps
+        """Steps of each chunk that are executed (phoenix_steps): before the next inference
+        with synchronous chunks, the re-planning period with phoenix_async."""
+        return self.timeline.steps + self.timeline.delay if self.timeline is not None else self.steps
 
     @property
     def execution_steps_max(self) -> int:
@@ -846,12 +853,13 @@ class PhoenixClient:
     def set_execution_steps(self, steps: int) -> int:
         """phoenix_steps from the next chunk on, without reloading the model."""
         steps = int(steps)
-        if not 1 <= steps <= self.execution_steps_max:
-            raise ValueError(f"steps per chunk must be 1..{self.execution_steps_max}, got {steps}")
+        least = self.timeline.delay + 1 if self.timeline is not None else 1  # async: longer than one inference
+        if not least <= steps <= self.execution_steps_max:
+            raise ValueError(f"steps per chunk must be {least}..{self.execution_steps_max}, got {steps}")
         if self.serial is not None:
             self.serial.check(steps)
-        if self.timeline is not None:  # async: the timeline launches the next chunk after s of its own steps
-            self.timeline.steps = steps
+        if self.timeline is not None:  # async: the next chunk is launched d steps before this period is over
+            self.timeline.steps = steps - self.timeline.delay
         else:  # sync: the worker returns that many steps of each chunk
             self.info = self._rpc({"cmd": "set", "replan_steps": steps})["info"]
         self.steps = steps

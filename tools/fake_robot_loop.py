@@ -50,16 +50,16 @@ class Env:
 results = {}
 SETTINGS = [
     ("sync s20", {"phoenix_steps": 20}),
-    ("async s14 d6", {"phoenix_steps": 14, "phoenix_async": "real", "phoenix_inference_delay": 6}),
-    ("async s14 d6 inpaint", {"phoenix_steps": 14, "phoenix_async": "real", "phoenix_inference_delay": 6,
-                              "phoenix_rtc_infer": "inpaint"}),
-    ("async s20 d6 inpaint", {"phoenix_steps": 20, "phoenix_async": "real", "phoenix_inference_delay": 6,
-                              "phoenix_rtc_infer": "inpaint"}),
-    ("async s10 d10 guidance", {"phoenix_steps": 10, "phoenix_async": "real", "phoenix_inference_delay": 10,
-                                "phoenix_rtc_infer": "guidance"}),
+    ("async period 20 d6", {"phoenix_steps": 20, "phoenix_async": "real", "phoenix_inference_delay": 6}),
+    ("async period 20 d6 inpaint", {"phoenix_steps": 20, "phoenix_async": "real", "phoenix_inference_delay": 6,
+                                    "phoenix_rtc_infer": "inpaint"}),
+    ("async period 26 d6 inpaint", {"phoenix_steps": 26, "phoenix_async": "real", "phoenix_inference_delay": 6,
+                                    "phoenix_rtc_infer": "inpaint"}),
+    ("async period 20 d10 guidance", {"phoenix_steps": 20, "phoenix_async": "real", "phoenix_inference_delay": 10,
+                                      "phoenix_rtc_infer": "guidance"}),
     ("sync s20 compile + frame cache", {"phoenix_steps": 20, "phoenix_compile": True, "phoenix_frame_cache": True}),
-    ("async s14 d6 inpaint compile + frame cache", {
-        "phoenix_steps": 14, "phoenix_async": "real", "phoenix_inference_delay": 6, "phoenix_rtc_infer": "inpaint",
+    ("async period 20 d6 inpaint compile + frame cache", {
+        "phoenix_steps": 20, "phoenix_async": "real", "phoenix_inference_delay": 6, "phoenix_rtc_infer": "inpaint",
         "phoenix_compile": True, "phoenix_frame_cache": True}),
 ]
 for name, extra in SETTINGS:
