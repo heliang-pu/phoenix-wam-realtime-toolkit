@@ -275,8 +275,8 @@ The frame cache alone changes less than compiling does (0.0003–0.0007 rad), an
 for bit the original ones. In a float64 stand-in of the trunk (in the tests) the cached result equals the full
 forward to 1e-10: the real model's difference is rounding.
 
-So the change is about a tenth of what drawing new noise does. Whether it affects task success has not been
-measured.
+So the change is about a tenth of what drawing new noise does. In a simulator comparison over the same episodes,
+with both options on against neither, task success showed no decrease. On a robot it has not been compared.
 
 ### Notes
 
